@@ -1,21 +1,17 @@
 from functools import reduce
-from math import sqrt, log
-from sympy import sympify, simplify
+from sympy import sympify, simplify, N
 import re
 
 # ------------------- Funções auxiliares -------------------
 def logical_and_mathematical_operation(number, choices):
-    """Retorna o produto dos valores escolhidos pelo padrão binário de 'number'."""
     bits = [int(i) for i in bin(number)[2:].zfill(len(choices))]
     return reduce(lambda a, b: a * b, [v for bit, v in zip(bits, choices) if bit], 1)
 
 def choice_enabler(number, choices):
-    """Retorna a lista de variáveis ativas para o número binário dado."""
     bits = [int(i) for i in bin(number)[2:].zfill(len(choices))]
     return [v for bit, v in zip(bits, choices) if bit]
 
 def binary_search_miniterm(wanted, dictionary):
-    """Busca binária para encontrar o minitermo mais próximo do valor desejado."""
     items = sorted(dictionary.items(), key=lambda x: x[1])
     values = [v for _, v in items]
     keys = [k for k, _ in items]
@@ -30,6 +26,10 @@ def binary_search_miniterm(wanted, dictionary):
             r = mid - 1
     idx = min(max(l, 0), len(values) - 1)
     return values[idx], keys[idx]
+
+def safe_eval(expr):
+    """Avaliação segura de expressões numéricas."""
+    return eval(compile(expr, "", "eval"), {"__builtins__": None}, {})
 
 # ------------------- Função Principal -------------------
 def generate_optimized_expression(data, expected_result, tol=1e-9, max_iter=1000):
@@ -52,24 +52,38 @@ def generate_optimized_expression(data, expected_result, tol=1e-9, max_iter=1000
         result += approx if result < expected_result else -approx
         count += 1
 
-    # Monta expressão simbólica
+    # Monta expressão bruta
     raw_expr = "".join(terms).lstrip("+")
+
+    # 🔹 Substitui todos os nomes de variáveis por seus valores numéricos (escapando caracteres especiais)
+    numeric_expr = raw_expr
     for k, v in data.items():
-        raw_expr = re.sub(rf"\b{k}\b", f"({v})", raw_expr)
+        pattern = r"\b" + re.escape(k) + r"\b"
+        numeric_expr = re.sub(pattern, f"({v})", numeric_expr)
 
-    # Usa sympy para simplificação avançada
+    # 🔹 Corrige potências para formato Python/Sympy
+    numeric_expr = numeric_expr.replace("^", "**")
+
+    # 🔹 Avaliação segura
     try:
-        sym_expr = sympify(raw_expr)
+        # Tenta Sympy
+        sym_expr = sympify(numeric_expr, evaluate=True)
         simplified_expr = simplify(sym_expr)
+        evaluated = float(N(simplified_expr))
     except Exception:
-        simplified_expr = raw_expr  # fallback caso sympy falhe
+        # Fallback: usa safe_eval diretamente
+        try:
+            evaluated = float(safe_eval(numeric_expr))
+            simplified_expr = numeric_expr
+        except Exception:
+            evaluated = None
+            simplified_expr = "Erro ao avaliar"
 
-    # Resultado final
-    evaluated = float(sym_expr.evalf()) if 'sym_expr' in locals() else eval(raw_expr)
-    inconsistency = abs(evaluated - expected_result) > tol
+    inconsistency = evaluated is None or abs(evaluated - expected_result) > tol
 
     return {
         "raw_expression": raw_expr,
+        "numeric_expression": numeric_expr,
         "simplified_expression": str(simplified_expr),
         "calculated": evaluated,
         "expected": expected_result,
@@ -95,12 +109,10 @@ if __name__ == "__main__":
     result = generate_optimized_expression(data, expected)
 
     # --- Saída final ---
-    print("\n📌 Expressão Bruta:", result["raw_expression"])
+    print("\n📌 Expressão Original:", result["raw_expression"])
+    print("📌 Expressão Numérica:", result["numeric_expression"])
     print("📌 Expressão Simplificada:", result["simplified_expression"])
     print(f"📌 Resultado Calculado: {result['calculated']}")
     print(f"📌 Resultado Esperado: {result['expected']}")
     print(f"📌 Variáveis Usadas ({result['usage_percent']}%): {', '.join(result['variables_used'])}")
-    if result["inconsistency"]:
-        print("⚠️ Inconsistência detectada na prova real!")
-    else:
-        print("✅ Prova real confirmada.")
+    print("⚠️ Inconsistência detectada!" if result["inconsistency"] else "✅ Prova real confirmada.")
