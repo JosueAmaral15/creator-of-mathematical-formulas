@@ -54,21 +54,18 @@ if __name__ == '__main__':
     set_of_terms_of_algebraic_expressions = set()
     used_literal_parts = set()
     tolerance = 0.000000001
-    #tolerance = 1
     count = 0
-    
+    print(truth_table_product_list)
     approximate_value, index_expected = binary_search.binary_search_to_find_miniterm_from_dict(margin_of_error_difference, truth_table_product_list) # Achamos o minitermo, que seria a seleção de variáveis que devem ser operandos de uma operação de multiplicação.
     final_result += approximate_value
     list_of_algebraic_literal_parts = truth_table_combination_list(index_expected, list(data.keys()))
     used_literal_parts.update(list_of_algebraic_literal_parts)
+    previous_signal = ""
+    previous_approximate_value = 0    
     
     while abs(expected_result -final_result) > tolerance and (count < operation_limit or not ENABLE_OPERATION_LIMIT): #and final_result + approximate_value < expected_result
         
-        if final_result < expected_result:
-            margin_of_error_difference = expected_result -final_result
-        else:
-            #print("DEBUG 108 enter here")
-            margin_of_error_difference = final_result - expected_result
+        margin_of_error_difference = abs(expected_result -final_result)
         
         # With this code scope, we want to create the polynomial algebraic expression without redundancies.
         insert_new_one = True
@@ -96,13 +93,19 @@ if __name__ == '__main__':
             
         set_of_terms_of_algebraic_expressions.add(tuple(list_of_algebraic_literal_parts)) # with this, we avoid repetition of the same variables in the same equation.
         
+        previous_approximate_value = approximate_value
         approximate_value, index_expected = binary_search.binary_search_to_find_miniterm_from_dict(margin_of_error_difference, truth_table_product_list) # Achamos o minitermo, que seria a seleção de variáveis que devem ser operandos de uma operação de multiplicação.
         
         if count +1 < operation_limit or not ENABLE_OPERATION_LIMIT:
             if final_result < expected_result:
+                #if final_result + approximate_value < expected_result:
                 final_result += approximate_value
+                previous_signal = SUM_SIGNAL
             else:
                 final_result -= approximate_value
+                if previous_approximate_value == approximate_value and previous_signal == SUM_SIGNAL:
+                    break
+                previous_signal = MINUS_SIGNAL
                 
             list_of_algebraic_literal_parts = truth_table_combination_list(index_expected, list(data.keys()))
             used_literal_parts.update(list_of_algebraic_literal_parts)
@@ -115,7 +118,7 @@ if __name__ == '__main__':
     for term_of_algebraic_expression in set_of_terms_of_algebraic_expressions:
         for data_dict_of_algebraic_terms in list_of_terms_of_algebraic_expressions:
             if term_of_algebraic_expression == tuple(data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"]):
-                terms_quantity += 1
+                terms_quantity += 1 # Counting how many times each term appears in the equation to calculate coefficients.
         for data_dict_of_algebraic_terms in list_of_terms_of_algebraic_expressions:
             if term_of_algebraic_expression == tuple(data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"]):
                 data_dict_of_algebraic_terms["terms_quantity"] = terms_quantity
