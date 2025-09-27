@@ -3,27 +3,31 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Iterable, Optional
 from bisect import bisect_right
 from itertools import combinations
+import re
 
 
 @dataclass(frozen=True)
 class Item:
-    """A truth-table minterm."""
-    value: float
-    literals: Tuple[str, ...]
+    value: float                 # numeric value of the minterm
+    literals: Tuple[str, ...]    # e.g., ('usdt_brl', 'inv:cos_usdt')
     idx: int
 
 
 @dataclass
 class Term:
-    """Symbolic term: coefficient * product(literals)."""
     literals: Tuple[str, ...]
     coeff: int = 1
-
     def key(self) -> Tuple[str, ...]:
         return self.literals
 
 
 class GreedyExpressionApproximator:
+    """
+    Build minterms with exponents in {-1, 0, +1} per base variable (inv:x means 1/x).
+    Select a subset (no repeats) whose sum is the best <= target.
+    Factor recursively by common subsets and render products as num/(den) safely,
+    avoiding precedence bugs when parentheses are omitted in 1/x.
+    """
     def __init__(self, data: Dict[str, float], target: float, tolerance: float = 1e-9):
         self.data = data
         self.target = target
@@ -33,54 +37,50 @@ class GreedyExpressionApproximator:
         self.factored_expr: str = ""
         self.final_value: float = 0.0
 
-    # =========================
-    # Utility methods
-    # =========================
-    def bitmask_pairs(self, n: int, items: List) -> Iterable[Tuple[int, float]]:
-        b = bin(n)[2:][::-1]
-        for bit, item in zip((int(ch) for ch in b), items[::-1]):
-            yield bit, item
-
-    def product_from_mask(self, n: int, values: List[float]) -> float:
-        prod = 1.0
-        for bit, v in self.bitmask_pairs(n, values):
-            if bit:
-                prod *= v
-        return prod
-
-    def chosen_names_from_mask(self, n: int, keys: List[str]) -> List[str]:
-        return [
-            name
-            for (bit, name) in (
-                (int(ch), nm) for ch, nm in zip(bin(n)[2:][::-1], keys[::-1])
-            )
-            if bit
-        ]
-
-    # =========================
-    # Build truth table
-    # =========================
+    # ---------- Build minterms with {-1,0,+1} exponents ----------
     def build_items(self):
         keys = list(self.data.keys())
         vals = list(self.data.values())
-        N = 2 ** len(self.data)
-
+        n = len(keys)
         uid = 0
-        for i in range(1, N):
-            v = self.product_from_mask(i, vals)
+
+        def enumerate_trits(n: int):
+            """Yield vectors of length n with entries in {-1,0,1}, excluding the all-zero vector."""
+            total = 3 ** n
+            for m in range(total):
+                vec = []
+                tmp = m
+                all_zero = True
+                for _ in range(n):
+                    d = tmp % 3  # 0,1,2
+                    tmp //= 3
+                    e = -1 if d == 0 else (0 if d == 1 else 1)
+                    vec.append(e)
+                    if e != 0:
+                        all_zero = False
+                if not all_zero:
+                    yield vec
+
+        for evec in enumerate_trits(n):
+            v = 1.0
+            lits: List[str] = []
+            for i, e in enumerate(evec):
+                if e == 1:
+                    v *= vals[i]
+                    lits.append(keys[i])
+                elif e == -1:
+                    v /= vals[i]
+                    lits.append(f"inv:{keys[i]}")  # inverse token
             if v <= 0:
                 continue
-            lits = tuple(sorted(self.chosen_names_from_mask(i, keys)))
             if v <= self.target + self.tolerance:
-                self.items.append(Item(value=v, literals=lits, idx=uid))
+                self.items.append(Item(value=v, literals=tuple(sorted(lits)), idx=uid))
                 uid += 1
 
         self.items.sort(key=lambda it: it.value)
-        print(f"[INFO] Generated {len(self.items)} valid minterms.")
+        print(f"[INFO] Generated {len(self.items)} valid minterms (with inverses).")
 
-    # =========================
-    # Knapsack-like selection (never exceeds target)
-    # =========================
+    # ---------- Selection (best <= target) ----------
     def select_items(self):
         values_sorted = [it.value for it in self.items]
         selected: List[int] = []
@@ -97,7 +97,7 @@ class GreedyExpressionApproximator:
                 pos -= 1
             return None
 
-        # Step 1: Greedy fill
+        # Greedy fill
         while True:
             gap = self.target - total
             pos = take_largest_not_exceeding(gap, selected_set)
@@ -108,7 +108,7 @@ class GreedyExpressionApproximator:
             selected.append(pos)
             selected_set.add(it.idx)
 
-        # Step 2: Pair fill and small improvements
+        # Pair fill improvement
         def best_pair_under_gap(gap: float, banned: set) -> Optional[Tuple[int, int, float]]:
             lo, hi = 0, len(self.items) - 1
             best = None
@@ -143,51 +143,23 @@ class GreedyExpressionApproximator:
                 selected_set.add(self.items[i].idx)
                 selected_set.add(self.items[j].idx)
                 improved = True
-                continue
 
-            # Try 1→2 replacement
-            chosen_sorted = sorted(selected, key=lambda p: self.items[p].value)
-            for rem_pos in chosen_sorted:
-                freed = self.items[rem_pos].value
-                gap2 = self.target - (total - freed)
-                banned = selected_set.copy()
-                banned.remove(self.items[rem_pos].idx)
-                pair2 = best_pair_under_gap(gap2, banned)
-                if pair2:
-                    i, j, s = pair2
-                    if s > freed + 1e-12:
-                        total = total - freed + s
-                        selected_set.remove(self.items[rem_pos].idx)
-                        selected.remove(rem_pos)
-                        if self.items[i].idx not in selected_set:
-                            selected.append(i)
-                            selected_set.add(self.items[i].idx)
-                        if self.items[j].idx not in selected_set:
-                            selected.append(j)
-                            selected_set.add(self.items[j].idx)
-                        improved = True
-                        break
-
+        # Safety
         assert total <= self.target + self.tolerance
         self.final_value = total
 
-        # Create terms
-        self.terms = [Term(self.items[pos].literals, coeff=1) for pos in selected]
-        self.terms = self.simplify_terms(self.terms)
+        # Build unique terms list
+        self.terms = [Term(self.items[p].literals, 1) for p in selected]
+        self.terms = self._simplify_terms(self.terms)
 
-    # =========================
-    # Simplify & factorization
-    # =========================
-    def simplify_terms(self, terms: List[Term]) -> List[Term]:
+    # ---------- Factorization ----------
+    def _simplify_terms(self, terms: List[Term]) -> List[Term]:
         c = Counter()
         for t in terms:
             c[t.key()] += t.coeff
         return [Term(lits, coeff) for lits, coeff in c.items() if coeff != 0]
 
-    def score_factor(self, sub: Tuple[str, ...], hits: int) -> Tuple[int, int]:
-        return (len(sub), hits)
-
-    def find_best_common_subset(self, tlist: List[Term]) -> Optional[Tuple[Tuple[str, ...], List[int]]]:
+    def _find_best_common_subset(self, tlist: List[Term]) -> Optional[Tuple[Tuple[str, ...], List[int]]]:
         index_by_subset: Dict[Tuple[str, ...], List[int]] = defaultdict(list)
         for idx, t in enumerate(tlist):
             lits = list(t.literals)
@@ -200,13 +172,39 @@ class GreedyExpressionApproximator:
         for sub, idxs in index_by_subset.items():
             if len(idxs) < 2:
                 continue
-            sc = self.score_factor(sub, len(idxs))
+            sc = (len(sub), len(idxs))  # prefer larger subset, then more hits
             if sc > best_sc:
                 best_sc = sc
                 best = (sub, idxs)
         return best
 
-    def render_sum(self, tlist: List[Term]) -> str:
+    # ---- NEW: robust product rendering (no ambiguous 1/x) ----
+    def _render_product(self, lits: Tuple[str, ...]) -> str:
+        """
+        Render a product of tokens where tokens can be 'var' or 'inv:var' (meaning 1/var).
+        Returns a string like:
+          'a*b/c'                 (1 denominator)
+          'a*b/(c*d)'             (>=2 denominators)
+          '1/c'                   (no numerator)
+        """
+        nums: List[str] = []
+        dens: List[str] = []
+        for tok in lits:
+            if tok.startswith("inv:"):
+                dens.append(tok[4:])
+            else:
+                nums.append(tok)
+        if not nums:
+            nums = ["1"]
+        num = "*".join(nums)
+        if not dens:
+            return num
+        if len(dens) == 1:
+            return f"{num}/{dens[0]}"
+        den = "*".join(dens)
+        return f"{num}/({den})"
+
+    def _render_sum(self, tlist: List[Term]) -> str:
         if not tlist:
             return "0"
         parts = []
@@ -214,17 +212,14 @@ class GreedyExpressionApproximator:
             if len(t.literals) == 0:
                 parts.append(str(t.coeff))
             else:
-                if t.coeff == 1:
-                    parts.append("*".join(t.literals))
-                else:
-                    parts.append(str(t.coeff) + "*" + "*".join(t.literals))
+                parts.append(self._render_product(t.literals))
         return " + ".join(parts)
 
-    def factor_recursive(self, tlist: List[Term]) -> str:
-        tlist = self.simplify_terms(tlist)
-        best = self.find_best_common_subset(tlist)
+    def _factor_recursive(self, tlist: List[Term]) -> str:
+        tlist = self._simplify_terms(tlist)
+        best = self._find_best_common_subset(tlist)
         if not best:
-            return self.render_sum(tlist)
+            return self._render_sum(tlist)
         sub, idxs = best
         sub_set = set(sub)
         inside, outside = [], []
@@ -234,31 +229,29 @@ class GreedyExpressionApproximator:
                 inside.append(Term(remain, t.coeff))
             else:
                 outside.append(t)
-        inside_str = self.factor_recursive(inside)
-        outside_str = self.factor_recursive(outside) if outside else ""
-        factor_str = "*".join(sub)
+        inside_str = self._factor_recursive(inside)
+        outside_str = self._factor_recursive(outside) if outside else ""
+        factor_str = self._render_product(sub)
         if outside_str and outside_str != "0":
             return f"{factor_str}*({inside_str}) + {outside_str}"
         else:
             return f"{factor_str}*({inside_str})"
 
-    # =========================
-    # Evaluate final expression
-    # =========================
+    # ---------- Evaluate ----------
     def evaluate_expression(self, expr: str) -> float:
         expr_eval = expr
+        # Replace longer keys first & use word boundaries to avoid partial matches
         for k in sorted(self.data.keys(), key=len, reverse=True):
-            expr_eval = expr_eval.replace(k, str(self.data[k]))
+            expr_eval = re.sub(rf'\b{k}\b', str(self.data[k]), expr_eval)
         return eval(expr_eval, {"__builtins__": {}})
 
-    # =========================
-    # Main workflow
-    # =========================
+    # ---------- Run ----------
     def run(self):
         self.build_items()
         self.select_items()
-        self.factored_expr = self.factor_recursive(self.terms)
-        numeric_result = self.evaluate_expression(self.factored_expr)
+        expr = self._factor_recursive(self.terms)
+        self.factored_expr = expr
+        numeric_result = self.evaluate_expression(expr)
         return {
             "used_literals": sorted({l for t in self.terms for l in t.literals}),
             "final_sum": self.final_value,
@@ -267,19 +260,13 @@ class GreedyExpressionApproximator:
         }
 
 
-# =========================
-# Example usage
-# =========================
+# ------------------ Example ------------------
 if __name__ == "__main__":
     data = {
-        "min_qty_inverse": 10,
         "min_qty": 0.1,
-        "cos_brl_inverse(brl_cos)": 44.451936077,
         "cos_brl": 0.022496208,
-        "cos_usdt_inverse(usdt_cos)": 258.999999,
         "cos_usdt": 0.003864,
-        "usdt_brl_inverse(brl_usdt)" : 0.192307692,
-        "usdt_brl" : 5.2,
+        "usdt_brl": 5.2,
     }
     target = 159.2
 
@@ -287,7 +274,7 @@ if __name__ == "__main__":
     result = approximator.run()
 
     print("Used variables:", ", ".join(result["used_literals"]))
-    print(f"Final sum: {result['final_sum']:.12f} | Target: {target}")
+    print(f"Final sum (≤ target): {result['final_sum']:.12f} | Target: {target}")
     print("Factored expression (recursive):")
     print(result["expression"])
     print("Numeric check (substitution):")
