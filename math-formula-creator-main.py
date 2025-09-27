@@ -1,26 +1,276 @@
-'''
-[] colocar o número 1 como valor unitário sempre quando a substituição de partes literais implicar em desaparecimento de termos. Além disso, somar esses valores unitários para definir constantes dentro de parênteses
-[] Sempre verificar o que está fora dos parênteses para não substituir partes literais de termos fora de parênteses;
-[] Inserir e tratar os coeficientes na fórmula de forma que a equação seja sempre válida.
-[] entender o motivo de não haver operação de subtração na fórmula;
-[] compreender inconsistências de resultados da prova real;
-[] verificar a possibilidade de reduzir ainda mais a fórmula com a utilização de operações de exponenciação, radiciação e logaritmo;
-
-'''
-
-from functools import reduce
-from re import escape, findall
-from math import isfinite
-from binary_search import BinarySearch
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Iterable, Optional
+from bisect import bisect_right
+from itertools import combinations
 
 
+@dataclass(frozen=True)
+class Item:
+    """A truth-table minterm."""
+    value: float
+    literals: Tuple[str, ...]
+    idx: int
 
-if __name__ == '__main__':
-    array_tuples_choice_pair = lambda number, choices: [(i,j) for i,j in zip([int(i) for i in str(bin(number))[2:][::-1]], choices[::-1])]
-    truth_table_combination_multiplication = lambda number, choices: reduce(lambda a, b: a * b, list(map(lambda x: x[1], list(filter(lambda a: a[0] * a[1], array_tuples_choice_pair(number,choices))))),1)
-    truth_table_combination_list = lambda number, choices: list(map(lambda a: a[1], list(filter(lambda a: a[0], array_tuples_choice_pair(number, choices)))))
-    binary_search = BinarySearch()
-    
+
+@dataclass
+class Term:
+    """Symbolic term: coefficient * product(literals)."""
+    literals: Tuple[str, ...]
+    coeff: int = 1
+
+    def key(self) -> Tuple[str, ...]:
+        return self.literals
+
+
+class GreedyExpressionApproximator:
+    def __init__(self, data: Dict[str, float], target: float, tolerance: float = 1e-9):
+        self.data = data
+        self.target = target
+        self.tolerance = tolerance
+        self.items: List[Item] = []
+        self.terms: List[Term] = []
+        self.factored_expr: str = ""
+        self.final_value: float = 0.0
+
+    # =========================
+    # Utility methods
+    # =========================
+    def bitmask_pairs(self, n: int, items: List) -> Iterable[Tuple[int, float]]:
+        b = bin(n)[2:][::-1]
+        for bit, item in zip((int(ch) for ch in b), items[::-1]):
+            yield bit, item
+
+    def product_from_mask(self, n: int, values: List[float]) -> float:
+        prod = 1.0
+        for bit, v in self.bitmask_pairs(n, values):
+            if bit:
+                prod *= v
+        return prod
+
+    def chosen_names_from_mask(self, n: int, keys: List[str]) -> List[str]:
+        return [
+            name
+            for (bit, name) in (
+                (int(ch), nm) for ch, nm in zip(bin(n)[2:][::-1], keys[::-1])
+            )
+            if bit
+        ]
+
+    # =========================
+    # Build truth table
+    # =========================
+    def build_items(self):
+        keys = list(self.data.keys())
+        vals = list(self.data.values())
+        N = 2 ** len(self.data)
+
+        uid = 0
+        for i in range(1, N):
+            v = self.product_from_mask(i, vals)
+            if v <= 0:
+                continue
+            lits = tuple(sorted(self.chosen_names_from_mask(i, keys)))
+            if v <= self.target + self.tolerance:
+                self.items.append(Item(value=v, literals=lits, idx=uid))
+                uid += 1
+
+        self.items.sort(key=lambda it: it.value)
+        print(f"[INFO] Generated {len(self.items)} valid minterms.")
+
+    # =========================
+    # Knapsack-like selection (never exceeds target)
+    # =========================
+    def select_items(self):
+        values_sorted = [it.value for it in self.items]
+        selected: List[int] = []
+        selected_set = set()
+        total = 0.0
+
+        def take_largest_not_exceeding(gap: float, banned: set) -> Optional[int]:
+            if gap <= 0:
+                return None
+            pos = bisect_right(values_sorted, gap) - 1
+            while pos >= 0:
+                if self.items[pos].idx not in banned:
+                    return pos
+                pos -= 1
+            return None
+
+        # Step 1: Greedy fill
+        while True:
+            gap = self.target - total
+            pos = take_largest_not_exceeding(gap, selected_set)
+            if pos is None:
+                break
+            it = self.items[pos]
+            total += it.value
+            selected.append(pos)
+            selected_set.add(it.idx)
+
+        # Step 2: Pair fill and small improvements
+        def best_pair_under_gap(gap: float, banned: set) -> Optional[Tuple[int, int, float]]:
+            lo, hi = 0, len(self.items) - 1
+            best = None
+            best_sum = -1.0
+            while lo < hi:
+                a, b = self.items[lo], self.items[hi]
+                if a.idx in banned:
+                    lo += 1
+                    continue
+                if b.idx in banned:
+                    hi -= 1
+                    continue
+                s = a.value + b.value
+                if s > gap + self.tolerance:
+                    hi -= 1
+                else:
+                    if s > best_sum:
+                        best_sum = s
+                        best = (lo, hi, s)
+                    lo += 1
+            return best
+
+        improved = True
+        while improved:
+            improved = False
+            gap = self.target - total
+            pair = best_pair_under_gap(gap, selected_set)
+            if pair:
+                i, j, s = pair
+                total += s
+                selected.extend([i, j])
+                selected_set.add(self.items[i].idx)
+                selected_set.add(self.items[j].idx)
+                improved = True
+                continue
+
+            # Try 1→2 replacement
+            chosen_sorted = sorted(selected, key=lambda p: self.items[p].value)
+            for rem_pos in chosen_sorted:
+                freed = self.items[rem_pos].value
+                gap2 = self.target - (total - freed)
+                banned = selected_set.copy()
+                banned.remove(self.items[rem_pos].idx)
+                pair2 = best_pair_under_gap(gap2, banned)
+                if pair2:
+                    i, j, s = pair2
+                    if s > freed + 1e-12:
+                        total = total - freed + s
+                        selected_set.remove(self.items[rem_pos].idx)
+                        selected.remove(rem_pos)
+                        if self.items[i].idx not in selected_set:
+                            selected.append(i)
+                            selected_set.add(self.items[i].idx)
+                        if self.items[j].idx not in selected_set:
+                            selected.append(j)
+                            selected_set.add(self.items[j].idx)
+                        improved = True
+                        break
+
+        assert total <= self.target + self.tolerance
+        self.final_value = total
+
+        # Create terms
+        self.terms = [Term(self.items[pos].literals, coeff=1) for pos in selected]
+        self.terms = self.simplify_terms(self.terms)
+
+    # =========================
+    # Simplify & factorization
+    # =========================
+    def simplify_terms(self, terms: List[Term]) -> List[Term]:
+        c = Counter()
+        for t in terms:
+            c[t.key()] += t.coeff
+        return [Term(lits, coeff) for lits, coeff in c.items() if coeff != 0]
+
+    def score_factor(self, sub: Tuple[str, ...], hits: int) -> Tuple[int, int]:
+        return (len(sub), hits)
+
+    def find_best_common_subset(self, tlist: List[Term]) -> Optional[Tuple[Tuple[str, ...], List[int]]]:
+        index_by_subset: Dict[Tuple[str, ...], List[int]] = defaultdict(list)
+        for idx, t in enumerate(tlist):
+            lits = list(t.literals)
+            if len(lits) >= 2:
+                for sub in combinations(lits, 2):
+                    index_by_subset[tuple(sorted(sub))].append(idx)
+            for sub in combinations(lits, 1):
+                index_by_subset[(sub[0],)].append(idx)
+        best, best_sc = None, (0, 0)
+        for sub, idxs in index_by_subset.items():
+            if len(idxs) < 2:
+                continue
+            sc = self.score_factor(sub, len(idxs))
+            if sc > best_sc:
+                best_sc = sc
+                best = (sub, idxs)
+        return best
+
+    def render_sum(self, tlist: List[Term]) -> str:
+        if not tlist:
+            return "0"
+        parts = []
+        for t in tlist:
+            if len(t.literals) == 0:
+                parts.append(str(t.coeff))
+            else:
+                if t.coeff == 1:
+                    parts.append("*".join(t.literals))
+                else:
+                    parts.append(str(t.coeff) + "*" + "*".join(t.literals))
+        return " + ".join(parts)
+
+    def factor_recursive(self, tlist: List[Term]) -> str:
+        tlist = self.simplify_terms(tlist)
+        best = self.find_best_common_subset(tlist)
+        if not best:
+            return self.render_sum(tlist)
+        sub, idxs = best
+        sub_set = set(sub)
+        inside, outside = [], []
+        for i, t in enumerate(tlist):
+            if i in idxs:
+                remain = tuple(sorted(x for x in t.literals if x not in sub_set))
+                inside.append(Term(remain, t.coeff))
+            else:
+                outside.append(t)
+        inside_str = self.factor_recursive(inside)
+        outside_str = self.factor_recursive(outside) if outside else ""
+        factor_str = "*".join(sub)
+        if outside_str and outside_str != "0":
+            return f"{factor_str}*({inside_str}) + {outside_str}"
+        else:
+            return f"{factor_str}*({inside_str})"
+
+    # =========================
+    # Evaluate final expression
+    # =========================
+    def evaluate_expression(self, expr: str) -> float:
+        expr_eval = expr
+        for k in sorted(self.data.keys(), key=len, reverse=True):
+            expr_eval = expr_eval.replace(k, str(self.data[k]))
+        return eval(expr_eval, {"__builtins__": {}})
+
+    # =========================
+    # Main workflow
+    # =========================
+    def run(self):
+        self.build_items()
+        self.select_items()
+        self.factored_expr = self.factor_recursive(self.terms)
+        numeric_result = self.evaluate_expression(self.factored_expr)
+        return {
+            "used_literals": sorted({l for t in self.terms for l in t.literals}),
+            "final_sum": self.final_value,
+            "expression": self.factored_expr,
+            "numeric_result": numeric_result,
+        }
+
+
+# =========================
+# Example usage
+# =========================
+if __name__ == "__main__":
     data = {
         "min_qty_inverse": 10,
         "min_qty": 0.1,
@@ -31,209 +281,14 @@ if __name__ == '__main__':
         "usdt_brl_inverse(brl_usdt)" : 0.192307692,
         "usdt_brl" : 5.2,
     }
-    
-    values = list(data.values())
-    truth_table_product_list = dict()
-    expected_result = 120.59
-    number_of_rows_in_the_truth_table = 2**len(data)
-    
-    for i in range(number_of_rows_in_the_truth_table):
-        result = truth_table_combination_multiplication(i,values) # Calcula os resultados de multiplicação e de divisão com influência de uma tabela verdade
-        truth_table_product_list[i] = result # Os resultados são armazenados em um dicionário ordenado pelas chaves com influência do número binário definido pela variável de iteração i.
-        
-    ENABLE_OPERATION_LIMIT = True
-    SUM_SIGNAL = " + "
-    MINUS_SIGNAL = " - "
-    MUL_SIGNAL = " * "
-    final_result = 0
-    margin_of_error_difference = expected_result
-    operation_limit = number_of_rows_in_the_truth_table # Para não acontecer loops infinitos, se coloca uma restrição de iteração:
-    truth_table_product_list = sorted(truth_table_product_list.items(), key=lambda x: x[1]) # O dicionário passa a ser ordenado pelos valores e não mais pelas chaves.
-    truth_table_product_list = dict(truth_table_product_list)
-    list_of_terms_of_algebraic_expressions  = list()
-    set_of_terms_of_algebraic_expressions = set()
-    used_literal_parts = set()
-    tolerance = 0.000000001
-    count = 0
-    print(truth_table_product_list)
-    approximate_value, index_expected = binary_search.binary_search_to_find_miniterm_from_dict(margin_of_error_difference, truth_table_product_list) # Achamos o minitermo, que seria a seleção de variáveis que devem ser operandos de uma operação de multiplicação.
-    final_result += approximate_value
-    list_of_algebraic_literal_parts = truth_table_combination_list(index_expected, list(data.keys()))
-    used_literal_parts.update(list_of_algebraic_literal_parts)
-    previous_signal = ""
-    previous_approximate_value = 0    
-    
-    while abs(expected_result -final_result) > tolerance and (count < operation_limit or not ENABLE_OPERATION_LIMIT): #and final_result + approximate_value < expected_result
-        
-        margin_of_error_difference = abs(expected_result -final_result)
-        
-        # With this code scope, we want to create the polynomial algebraic expression without redundancies.
-        insert_new_one = True
-        #if tuple(list_of_algebraic_literal_parts) in set_of_terms_of_algebraic_expressions and len(list_of_terms_of_algebraic_expressions) > 0:
-        # for data_dict_of_algebraic_terms in list_of_terms_of_algebraic_expressions:
-        #     if list_of_algebraic_literal_parts == data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"]:
-        #         if data_dict_of_algebraic_terms["signal"] == SUM_SIGNAL:
-        #             if not final_result < expected_result:
-        #                 insert_new_one = False
-        #                 break
-        #         elif data_dict_of_algebraic_terms["signal"] == MINUS_SIGNAL:
-        #             if final_result < expected_result:
-        #                 insert_new_one = False
-        #                 break
-        
-        # In this code scope, the coeficient of each term is calculated.
-        # if insert_new_one:
-        #     for data_dict_of_algebraic_terms in list_of_terms_of_algebraic_expressions[::-1]:
-        #         if list_of_algebraic_literal_parts == data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"]:
-        #                 data_dict_of_algebraic_terms["terms_quantity"] += 1
-        #                 break
-                
-        if insert_new_one:
-            list_of_terms_of_algebraic_expressions.append({"terms_quantity" : 1, "signal":  SUM_SIGNAL if final_result < expected_result else MINUS_SIGNAL, "list_of_algebraic_literal_parts": list_of_algebraic_literal_parts})
-            
-        set_of_terms_of_algebraic_expressions.add(tuple(list_of_algebraic_literal_parts)) # with this, we avoid repetition of the same variables in the same equation.
-        
-        previous_approximate_value = approximate_value
-        approximate_value, index_expected = binary_search.binary_search_to_find_miniterm_from_dict(margin_of_error_difference, truth_table_product_list) # Achamos o minitermo, que seria a seleção de variáveis que devem ser operandos de uma operação de multiplicação.
-        
-        if count +1 < operation_limit or not ENABLE_OPERATION_LIMIT:
-            if final_result < expected_result:
-                #if final_result + approximate_value < expected_result:
-                final_result += approximate_value
-                previous_signal = SUM_SIGNAL
-            else:
-                final_result -= approximate_value
-                if previous_approximate_value == approximate_value and previous_signal == SUM_SIGNAL:
-                    break
-                previous_signal = MINUS_SIGNAL
-                
-            list_of_algebraic_literal_parts = truth_table_combination_list(index_expected, list(data.keys()))
-            used_literal_parts.update(list_of_algebraic_literal_parts)
-        count += 1
-    
-    count_variables = dict()
-    terms_quantity = 0
-    
-    # In this code scope, we calculate the coeficient of each term.
-    for term_of_algebraic_expression in set_of_terms_of_algebraic_expressions:
-        for data_dict_of_algebraic_terms in list_of_terms_of_algebraic_expressions:
-            if term_of_algebraic_expression == tuple(data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"]):
-                terms_quantity += 1 # Counting how many times each term appears in the equation to calculate coefficients.
-        for data_dict_of_algebraic_terms in list_of_terms_of_algebraic_expressions:
-            if term_of_algebraic_expression == tuple(data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"]):
-                data_dict_of_algebraic_terms["terms_quantity"] = terms_quantity
-    
-    # Now, identifying the variables that are most used in the algebraic expression.
-    for used_literal_part in used_literal_parts:  # In this algorithm scope, we want to discover which variable is more frequently used in the equation.
-        count_variables[used_literal_part] = 0 # The counter is initialized to zero.
-        for data_dict_of_algebraic_terms in list_of_terms_of_algebraic_expressions: # We iterate over the list of tuples that contains the variables used in the equation.
-            for literal_part in data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"]: # We iterate over the variables used in the equatio and we want to count how many times each literal_part appears in neighboring equations to determine nesting by isolating these variables.
-                if literal_part == used_literal_part:
-                    count_variables[used_literal_part] +=1 # it may be unnecessary if this logic is placed during the construction of the variable list up there.
-                    break
-    
-    count_variables = sorted(count_variables.items(), key=lambda x: x[1], reverse=True)
-    count_variables = dict(count_variables)
-    
-    terms_hierarchy_structure = list()
-    literal_parts_to_be_removed = set()
-    dont_insert_anything = False
-    
-    # identifying the structure of the algebraic expression.
-    for variable_name, count in count_variables.items():
-        terms_inserted_into_parentesis = list()
-        terms_out_from_parentesis = list()
-        if count > 1:
-            for data_dict_of_algebraic_terms in list_of_terms_of_algebraic_expressions: # Determining which terms are inside the parenthesis and also out of the parenthesis.
-                found_variable = False
-                for literal_part in data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"]:
-                    if literal_part == variable_name:
-                        if data_dict_of_algebraic_terms["terms_quantity"] == 1:
-                            literal_parts_to_be_removed.add(literal_part)
-                            found_variable = True
-                            break
-                        else:
-                            dont_insert_anything = True
-                            
-                    
-                data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"] = [i for i in data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"] if i not in literal_parts_to_be_removed]
-                if not dont_insert_anything:
-                    if found_variable:
-                        terms_inserted_into_parentesis.append(dict(data_dict_of_algebraic_terms))
-                    else:
-                        terms_out_from_parentesis.append(dict(data_dict_of_algebraic_terms))
-                else:
-                    dont_insert_anything = False
-    
-        if terms_inserted_into_parentesis or terms_out_from_parentesis:
-            terms_hierarchy_structure.append({"variable_name" : variable_name, "terms_inserted_into_parentesis": terms_inserted_into_parentesis, "terms_out_from_parentesis": terms_out_from_parentesis})
-    
-    # Were we able to shorten the equation
-    #count_variables = sorted(count_variables.items(), key=lambda x: x[1])
-    #count_variables = dict(count_variables)
-    del count_variables
-    first_iteration = True
-    term_string = str()
-    
-    if terms_hierarchy_structure:
-        terms_hierarchy_structure = terms_hierarchy_structure[::-1]
-        for term_hierarchy_structure in terms_hierarchy_structure:
-            if not first_iteration:
-                term_list_out = list(filter(lambda x: x, [MUL_SIGNAL.join(data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"]) for data_dict_of_algebraic_terms in term_hierarchy_structure["terms_out_from_parentesis"]]))
-                polynomial = "".join([ signal+term for signal, term in zip([data_dict_of_algebraic_terms["signal"] for data_dict_of_algebraic_terms in term_hierarchy_structure["terms_out_from_parentesis"]], term_list_out)])
-                if sub_term_string[len(sub_term_string)-1:] != ')':
-                    term_string = f"{term_hierarchy_structure['variable_name']}{MUL_SIGNAL}({sub_term_string})"
-                else:
-                    term_string = f"{term_hierarchy_structure['variable_name']}{MUL_SIGNAL}{sub_term_string}"
-                term_string += polynomial
-                sub_term_string = term_string
-            else:
-                term_list_in = list(filter(lambda x: x, [MUL_SIGNAL.join(data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"]) for data_dict_of_algebraic_terms in term_hierarchy_structure["terms_inserted_into_parentesis"]]))
-                term_list_out = list(filter(lambda x: x, [MUL_SIGNAL.join(data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"]) for data_dict_of_algebraic_terms in term_hierarchy_structure["terms_out_from_parentesis"]]))
-                if any(term_list_in):
-                    sub_term_string = f"{term_hierarchy_structure['variable_name']}{MUL_SIGNAL}("
-                    polynomial = "".join([signal+term for signal, term in zip([data_dict_of_algebraic_terms["signal"] for data_dict_of_algebraic_terms in term_hierarchy_structure["terms_inserted_into_parentesis"]], term_list_in)])
-                    if polynomial[:len(SUM_SIGNAL)] != MINUS_SIGNAL:
-                        polynomial = polynomial[len(SUM_SIGNAL):]
-                    sub_term_string += polynomial + ")"
-                    if any(term_list_out):
-                        polynomial = "".join([signal+term for signal, term in zip([data_dict_of_algebraic_terms["signal"] for data_dict_of_algebraic_terms in term_hierarchy_structure["terms_out_from_parentesis"]], term_list_out)])
-                        sub_term_string += polynomial                    
-                else:
-                    print("ERROR 221 : term_list_in is empty and unknown error occurred!!!")
-                    if any(term_list_out):
-                        print("ERROR 223 : this command must not be executed, because not make sense!!!")
-                        sub_term_string = term_hierarchy_structure['variable_name']
-                        polynomial = "".join([signal+term for signal, term in zip([data_dict_of_algebraic_terms["signal"] for data_dict_of_algebraic_terms in term_hierarchy_structure["terms_out_from_parentesis"]], term_list_out)])
-                        sub_term_string += polynomial
-                    else:
-                        sub_term_string = term_hierarchy_structure['variable_name']
-                    
-                first_iteration = False
-    else:
-        for data_dict_of_algebraic_terms in list_of_terms_of_algebraic_expressions:
-            sub_term_string = MUL_SIGNAL.join(data_dict_of_algebraic_terms["list_of_algebraic_literal_parts"])
-            if first_iteration:
-                if data_dict_of_algebraic_terms["signal"] == MINUS_SIGNAL:
-                    term_string += data_dict_of_algebraic_terms["signal"] + sub_term_string
-                else:
-                    term_string += sub_term_string
-                first_iteration = False
-                
-    resulting_algebraic_expression = term_string
-    used_variables_str = ", ".join(used_literal_parts)
-    used_variables_quantity = len(used_literal_parts)
-    total_variables_quantity = len(values)
-    
-    print(f"The following variables were used: {used_variables_str}. In total, {used_variables_quantity} variables out a total of {total_variables_quantity} were used ({round((used_variables_quantity/total_variables_quantity)*100, 2)}%).")
-    if resulting_algebraic_expression:
-        print(f"To the approximate value: {final_result}, the variables used for the multiplication operation that most closely approximate the desired value are: {resulting_algebraic_expression}")
-    else:
-        print("Unfortunately, there are no terms in the equation.")
-    
-    for key, value in data.items():
-        resulting_algebraic_expression = resulting_algebraic_expression.replace(key, str(value))
-    
-    expression_result = eval(resulting_algebraic_expression)
-    
-    print(f"actual proof of the mathematical terms found: {expression_result}")
+    target = 159.2
+
+    approximator = GreedyExpressionApproximator(data, target)
+    result = approximator.run()
+
+    print("Used variables:", ", ".join(result["used_literals"]))
+    print(f"Final sum: {result['final_sum']:.12f} | Target: {target}")
+    print("Factored expression (recursive):")
+    print(result["expression"])
+    print("Numeric check (substitution):")
+    print(result["numeric_result"])
